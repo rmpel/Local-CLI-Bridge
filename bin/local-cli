@@ -1,0 +1,125 @@
+#!/usr/bin/env bash
+#
+# local-cli — command-line control of Local (LocalWP) sites.
+#
+# A drop-in replacement for the deprecated @getflywheel/local-cli: the same
+# command names (list-sites, start-site, stop-site) and the same table layout,
+# so scripts written against the old tool keep working.
+#
+# Deliberately a plain POSIX shell script that needs nothing but curl: it must
+# not care which `node` is active (nvm switches, .nvmrc files, containerised
+# runtimes, ...). All formatting is done by the CLI Bridge add-on inside Local,
+# reached over a Unix domain socket.
+#
+# Package: Local CLI Bridge
+# License: GPL-3.0-or-later, see LICENSE
+# Author:  Remon Pel
+#
+set -u
+
+# Must match src/constants.ts in the add-on.
+SOCKET="${LOCAL_CLI_BRIDGE_SOCKET:-$HOME/.local-cli-bridge/bridge.sock}"
+
+EXIT_FAILED=1
+EXIT_UNREACHABLE=2
+EXIT_USAGE=64
+
+usage() {
+	cat <<'USAGE'
+Usage: local-cli <command> [site] [--json|--plain]
+
+Commands:
+  list-sites             List all sites with ID, name and status
+  site-status <site>     Show one site
+  start-site <site>      Start a site (no-op when already running)
+  stop-site <site>       Stop a site (no-op when already stopped)
+  restart-site <site>    Restart a site
+  ping                   Check that Local and the CLI Bridge add-on are reachable
+  help                   Show this help
+
+<site> is a site ID, domain or name (case-insensitive); a unique prefix of
+the name or domain also works. Quote names containing spaces.
+
+Options:
+  --json    Print the raw JSON response (for scripts)
+  --plain   Tab-separated ID, name, domain, status without borders (for cut/awk)
+
+The table output matches the deprecated @getflywheel/local-cli (ID, Name,
+Status) so existing scripts that parse it keep working.
+
+Exit codes: 0 ok, 1 command failed, 2 Local/bridge unreachable, 64 usage error.
+Environment: LOCAL_CLI_BRIDGE_SOCKET overrides the socket path.
+USAGE
+}
+
+FORMAT=table
+COMMAND=""
+SITE=""
+for arg in "$@"; do
+	case "$arg" in
+		--json) FORMAT=json ;;
+		--plain) FORMAT=plain ;;
+		--help|-h) usage; exit 0 ;;
+		--*) printf 'local-cli: unknown option "%s"\n\n' "$arg" >&2; usage >&2; exit $EXIT_USAGE ;;
+		*)
+			if [ -z "$COMMAND" ]; then
+				COMMAND="$arg"
+			elif [ -z "$SITE" ]; then
+				SITE="$arg"
+			else
+				# Names may contain spaces; be forgiving when the user forgot to quote.
+				SITE="$SITE $arg"
+			fi
+			;;
+	esac
+done
+
+case "${COMMAND:-help}" in
+	help)         usage; exit 0 ;;
+	ping)         METHOD=GET;  ENDPOINT=/ping;         NEEDS_SITE=0 ;;
+	list-sites)   METHOD=GET;  ENDPOINT=/sites;        NEEDS_SITE=0 ;;
+	site-status)  METHOD=GET;  ENDPOINT=/site;         NEEDS_SITE=1 ;;
+	start-site)   METHOD=POST; ENDPOINT=/site/start;   NEEDS_SITE=1 ;;
+	stop-site)    METHOD=POST; ENDPOINT=/site/stop;    NEEDS_SITE=1 ;;
+	restart-site) METHOD=POST; ENDPOINT=/site/restart; NEEDS_SITE=1 ;;
+	*) printf 'local-cli: unknown command "%s"\n\n' "$COMMAND" >&2; usage >&2; exit $EXIT_USAGE ;;
+esac
+
+if [ "$NEEDS_SITE" -eq 1 ] && [ -z "$SITE" ]; then
+	printf 'local-cli: %s needs a site ID, domain or name\n\n' "$COMMAND" >&2
+	usage >&2
+	exit $EXIT_USAGE
+fi
+
+if ! command -v curl >/dev/null 2>&1; then
+	echo "local-cli: curl is required but not found on PATH" >&2
+	exit $EXIT_UNREACHABLE
+fi
+
+# The site reference travels as a form field so curl handles the URL-encoding
+# (-G turns it into a query string for GET requests).
+set -- --silent --show-error --unix-socket "$SOCKET" --max-time 0 \
+	--request "$METHOD" --header "Accept: text/plain" \
+	--write-out '\n%{http_code}' --data-urlencode "format=$FORMAT"
+[ "$METHOD" = "GET" ] && set -- "$@" --get
+[ "$NEEDS_SITE" -eq 1 ] && set -- "$@" --data-urlencode "site=$SITE"
+
+RESPONSE=$(curl "$@" "http://local$ENDPOINT" 2>&1)
+CURL_EXIT=$?
+
+if [ $CURL_EXIT -ne 0 ]; then
+	if [ ! -S "$SOCKET" ] || [ $CURL_EXIT -eq 7 ]; then
+		echo "local-cli: cannot reach Local at $SOCKET — is Local running with the \"CLI Bridge\" add-on enabled?" >&2
+	else
+		echo "local-cli: $RESPONSE" >&2
+	fi
+	exit $EXIT_UNREACHABLE
+fi
+
+STATUS=$(printf '%s' "$RESPONSE" | tail -n 1)
+BODY=$(printf '%s' "$RESPONSE" | sed '$d')
+
+case "$STATUS" in
+	2??) printf '%s\n' "$BODY"; exit 0 ;;
+	*)   printf 'local-cli: %s\n' "$BODY" >&2; exit $EXIT_FAILED ;;
+esac
