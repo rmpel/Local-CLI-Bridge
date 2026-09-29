@@ -1,6 +1,14 @@
+import * as fs from 'fs';
 import * as http from 'http';
+import * as path from 'path';
 import type * as Local from '@getflywheel/local';
-import { CONTENT_TYPES, Format, candidateTable, pingText, siteTable, transitionText } from './format';
+import {
+	CONTENT_TYPES, Format, addSiteText, candidateTable, changeServiceText, multisiteText, openText, pingText,
+	servicesText, siteTable, transitionText,
+} from './format';
+import { BUILT_IN_SITE_DEFAULTS, NewSiteDefaults, deriveDomain, expandHome, formatSiteNicename, validateNewSite } from './new-site';
+import { MS_VALUES, MultisiteDeps, MultisiteError, MultisiteResult, NetworkType, changeMultisite, modeFromSite, parseNetworkTarget } from './multisite';
+import { SERVICE_ROLES, ServiceCatalog, ServiceRole, isValidVersionSpec, resolveVersion } from './versions';
 
 /**
  * The slice of Local's main-process services the bridge needs. Kept as an
@@ -9,15 +17,38 @@ import { CONTENT_TYPES, Format, candidateTable, pingText, siteTable, transitionT
  */
 export interface SiteBackend {
 	getSites(): Local.Site[];
+	getSite(id: string): Local.Site | null;
+	getSiteByDomain(domain: string): Local.Site | null;
 	getStatus(site: Local.Site): string;
 	start(site: Local.Site): Promise<void>;
 	stop(site: Local.Site): Promise<void>;
 	restart(site: Local.Site): Promise<void>;
+	/** Installed plus downloadable versions for a role, as Local's "Custom" environment picker lists them. */
+	getServices(role: ServiceRole): Promise<ServiceCatalog>;
+	getNewSiteDefaults(): Partial<NewSiteDefaults>;
+	addSite(input: AddSiteInput): Promise<Local.Site>;
+	swapService(site: Local.Site, role: ServiceRole, serviceName: string, version: string): Promise<void>;
+	openInBrowser(url: string): void;
+	openDatabase(site: Local.Site): Promise<void>;
+	wpCli(site: Local.Site, args: string[]): Promise<string>;
+	updateSite(id: string, patch: Record<string, unknown>): void;
+	syncSubdomains(site: Local.Site): Promise<void>;
+	localhostRouting(): boolean;
+}
+
+export interface AddSiteInput {
+	newSiteInfo: Record<string, unknown>;
+	wpCredentials: { adminUsername: string; adminPassword: string; adminEmail: string };
+	goToSite: boolean;
+	installWP: boolean;
+	siteLanguage: string;
 }
 
 export interface BridgeInfo {
 	addonVersion: string;
 	localVersion: string;
+	/** Folder holding the PHP helpers run through WP-CLI. */
+	phpDir: string;
 }
 
 export interface SiteSummary {
@@ -27,16 +58,52 @@ export interface SiteSummary {
 	url: string;
 	path: string;
 	status: string;
+	multisite: '' | NetworkType;
 	services: Record<string, string>;
 }
 
-class HttpError extends Error {
+export interface ServiceRow {
+	role: ServiceRole;
+	name: string;
+	version: string;
+	installed: boolean;
+}
+
+export type OpenTarget = 'site' | 'admin' | 'mailpit' | 'db';
+
+export interface OpenResult extends SiteSummary {
+	target: OpenTarget;
+	openUrl: string;
+	opened: boolean;
+	autoLogin: boolean;
+}
+
+export interface AddSiteResult extends SiteSummary {
+	/** True when the reply went out before provisioning finished (`--no-wait`). */
+	pending: boolean;
+	credentials: { username: string; password: string; email: string };
+}
+
+export interface ChangeServiceResult extends SiteSummary {
+	op: string;
+	from: string;
+	to: string;
+	changed: boolean;
+	downloaded: boolean;
+}
+
+export type MultisiteReply = SiteSummary & MultisiteResult;
+
+export class HttpError extends Error {
 	constructor(public status: number, message: string, public extra: Record<string, unknown> = {}) {
 		super(message);
 	}
 }
 
-const summarize = (site: Local.Site, status: string): SiteSummary => {
+const serviceByRole = (site: Local.Site, role: string): { name: string; version: string } | undefined =>
+	Object.values<any>((site as any).services ?? {}).find((service) => service?.role === role);
+
+export const summarize = (site: Local.Site, status: string): SiteSummary => {
 	const services: Record<string, string> = {};
 	for (const [key, service] of Object.entries<any>((site as any).services ?? {})) {
 		if (service?.version) {
@@ -51,6 +118,7 @@ const summarize = (site: Local.Site, status: string): SiteSummary => {
 		url: (site as any).url ?? (domain ? `http://${domain}` : ''),
 		path: (site as any).longPath ?? (site as any).path ?? '',
 		status,
+		multisite: modeFromSite(site),
 		services,
 	};
 };
@@ -62,7 +130,7 @@ const summarize = (site: Local.Site, status: string): SiteSummary => {
 export const resolveSite = (sites: Local.Site[], ref: string): Local.Site => {
 	const needle = (ref ?? '').trim().toLowerCase();
 	if (!needle) {
-		throw new HttpError(400, 'Missing site reference: pass a site ID, domain or name.');
+		throw new HttpError(400, 'Missing site reference: pass a site ID, domain or name, or set LOCAL_SITE_ID / LOCAL_SITE_NAME.');
 	}
 
 	const exact = sites.find((site) =>
@@ -120,6 +188,13 @@ const pickFormat = (params: URLSearchParams, accept: string): Format => {
 	return accept.includes('text/plain') ? 'table' : 'json';
 };
 
+const flag = (params: URLSearchParams, name: string): boolean => {
+	const value = (params.get(name) ?? '').trim().toLowerCase();
+	return value === '1' || value === 'true' || value === 'yes' || value === 'on';
+};
+
+const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
 export const createBridgeServer = (backend: SiteBackend, info: BridgeInfo, log: (msg: string) => void): http.Server => {
 	/**
 	 * The site may come from the path (`/sites/{ref}/start`, handy with curl)
@@ -129,6 +204,8 @@ export const createBridgeServer = (backend: SiteBackend, info: BridgeInfo, log: 
 	const siteFrom = ({ params, pathParams }: Request) =>
 		resolveSite(backend.getSites(), pathParams[0] !== undefined ? decodeURIComponent(pathParams[0]) : params.get('site') ?? '');
 
+	const withStatus = (site: Local.Site): SiteSummary => summarize(site, backend.getStatus(site));
+
 	const transition = async (req: Request, action: 'start' | 'stop' | 'restart'): Promise<Reply> => {
 		const site = siteFrom(req);
 		const before = backend.getStatus(site);
@@ -137,14 +214,342 @@ export const createBridgeServer = (backend: SiteBackend, info: BridgeInfo, log: 
 			log(`${action} "${site.name}" (${site.id}), current status: ${before}`);
 			await backend[action](site);
 		}
-		const data = { ...summarize(site, backend.getStatus(site)), action, changed: !noop, previousStatus: before };
+		const data = { ...withStatus(site), action, changed: !noop, previousStatus: before };
 		return { data, text: (format) => transitionText(data, format) };
 	};
 
 	const status = async (req: Request): Promise<Reply> => {
-		const site = siteFrom(req);
-		const data = summarize(site, backend.getStatus(site));
+		const data = withStatus(siteFrom(req));
 		return { data, text: (format) => siteTable([data], format) };
+	};
+
+	/**
+	 * Resolve `<service> <spec>` to a concrete version the way Local does:
+	 * exact match, else the newest patch release of that major.minor, over
+	 * the installed and downloadable versions combined.
+	 */
+	const resolveService = async (name: string, spec?: string): Promise<{ name: string; version: string; installed: boolean }> => {
+		const role = SERVICE_ROLES[name];
+		if (!role) {
+			throw new HttpError(400, `Unknown service "${name}". Use php, mysql, mariadb, apache or nginx.`);
+		}
+		const wanted = (spec ?? '').trim();
+		if (wanted && !isValidVersionSpec(wanted)) {
+			throw new HttpError(400, `"${wanted}" is not a version. Use an exact version like 8.3.30 or a major.minor like 8.3.`);
+		}
+		const catalog = await backend.getServices(role);
+		const versions = Object.keys(catalog[name] ?? {});
+		if (!versions.length) {
+			throw new HttpError(409, `Local offers no ${name} service at all on this machine.`);
+		}
+		// A bare service name (`--apache`, `change-site … nginx`) means "what is
+		// installed", never a download; an explicit version means "newest that
+		// matches", downloaded if need be.
+		const installed = versions.filter((candidate) => catalog[name][candidate]?.registered);
+		const version = wanted ? resolveVersion(versions, wanted) : resolveVersion(installed.length ? installed : versions);
+		if (!version) {
+			throw new HttpError(400, `No ${name} version matches "${wanted}". Available: ${versions.join(', ')}.`);
+		}
+		return { name, version, installed: !!catalog[name][version]?.registered };
+	};
+
+	const listServices = async ({ params }: Request): Promise<Reply> => {
+		const requested = (params.get('role') ?? '').trim().toLowerCase();
+		const roles: ServiceRole[] = requested ? [SERVICE_ROLES[requested] ?? (requested as ServiceRole)] : ['php', 'db', 'http'];
+		if (roles.some((role) => !['php', 'db', 'http'].includes(role))) {
+			throw new HttpError(400, `Unknown role "${requested}". Use php, db (mysql/mariadb) or http (apache/nginx).`);
+		}
+		const rows: ServiceRow[] = [];
+		for (const role of roles) {
+			const catalog = await backend.getServices(role);
+			for (const [name, versions] of Object.entries(catalog)) {
+				for (const [version, details] of Object.entries(versions)) {
+					rows.push({ role, name, version, installed: !!details?.registered });
+				}
+			}
+		}
+		return { data: rows, text: (format) => servicesText(rows, format) };
+	};
+
+	const addSite = async ({ params }: Request): Promise<Reply> => {
+		const name = (params.get('name') ?? '').trim();
+		if (!name) {
+			throw new HttpError(400, 'A site name is required.');
+		}
+		const defaults: NewSiteDefaults = { ...BUILT_IN_SITE_DEFAULTS, ...backend.getNewSiteDefaults() };
+		const nicename = formatSiteNicename(name);
+		const domain = (params.get('domain') ?? '').trim().toLowerCase() || deriveDomain(nicename, defaults.tld);
+		const sitesPath = path.resolve(expandHome(defaults.sitesPath));
+		const sitePath = path.join(sitesPath, nicename);
+
+		const error = validateNewSite({
+			name,
+			domain,
+			sitePath,
+			sitesPath,
+			existingSites: backend.getSites().map((site) => ({
+				domain: (site as any).domain ?? '',
+				path: path.resolve(expandHome((site as any).path ?? '')),
+			})),
+			pathHasLocalData: fs.existsSync(path.join(sitePath, 'app')) || fs.existsSync(path.join(sitePath, 'conf')),
+			platform: process.platform,
+		});
+		if (error) {
+			throw new HttpError(400, error);
+		}
+
+		const multisiteParam = (params.get('multisite') ?? '').trim();
+		const multisite = multisiteParam ? parseNetworkTarget(multisiteParam) : 'off';
+		if (multisite === null) {
+			throw new HttpError(400, `Unknown multisite mode "${multisiteParam}". Use subdir or subdomain.`);
+		}
+		if (multisite === 'subdomain' && backend.localhostRouting()) {
+			throw new HttpError(400, 'A subdomain network is impossible while Local routes sites through localhost. Switch the router mode to site domains in Local\'s preferences first.');
+		}
+
+		const webServers = params.getAll('webserver').map((value) => value.trim().toLowerCase()).filter(Boolean);
+		if (webServers.length > 1) {
+			throw new HttpError(400, '--apache and --nginx are mutually exclusive.');
+		}
+		if (webServers.length && !['apache', 'nginx'].includes(webServers[0])) {
+			throw new HttpError(400, `Unknown web server "${webServers[0]}". Use --apache or --nginx.`);
+		}
+		const mysql = (params.get('mysql') ?? '').trim();
+		const mariadb = (params.get('mariadb') ?? '').trim();
+		if (mysql && mariadb) {
+			throw new HttpError(400, '--mysql and --mariadb are mutually exclusive.');
+		}
+		const phpSpec = (params.get('php') ?? '').trim();
+
+		// Like the Add Site dialog: no service choices means Local's "Preferred"
+		// environment and Local's own preferred versions; any choice means
+		// "Custom", with Local filling the services that were not chosen.
+		const php = phpSpec ? await resolveService('php', phpSpec) : null;
+		const database = mysql ? await resolveService('mysql', mysql) : mariadb ? await resolveService('mariadb', mariadb) : null;
+		const webServer = webServers.length ? await resolveService(webServers[0], params.get('webserver-version') ?? '') : null;
+		const custom = !!(php || database || webServer);
+
+		const newSiteInfo: Record<string, unknown> = {
+			siteName: name,
+			sitePath,
+			siteDomain: domain,
+			multiSite: multisite === 'off' ? '' : MS_VALUES[multisite],
+			environment: custom ? 'custom' : 'flywheel',
+			xdebugEnabled: false,
+		};
+		if (php) {
+			newSiteInfo.phpVersion = php.version;
+		}
+		if (database) {
+			newSiteInfo.database = `${database.name}-${database.version}`;
+		}
+		if (webServer) {
+			newSiteInfo.webServer = `${webServer.name}-${webServer.version}`;
+		}
+
+		const wpCredentials = {
+			adminUsername: (params.get('admin-user') ?? '').trim() || 'admin',
+			adminPassword: params.get('admin-password') || 'admin',
+			adminEmail: (params.get('admin-email') ?? '').trim() || defaults.adminEmail,
+		};
+		if (!/^[^\s@]+@[^\s@]+$/.test(wpCredentials.adminEmail)) {
+			throw new HttpError(400, `"${wpCredentials.adminEmail}" is not an email address.`);
+		}
+
+		log(`add-site "${name}" -> ${domain} at ${sitePath} (${custom ? 'custom' : 'preferred'} environment${multisite === 'off' ? '' : `, ${multisite} network`})`);
+		const creation = backend.addSite({
+			newSiteInfo,
+			wpCredentials,
+			goToSite: true,
+			installWP: true,
+			siteLanguage: defaults.siteLanguage,
+		});
+		creation.catch((err) => log(`add-site "${name}" failed: ${err?.stack ?? err}`));
+
+		const describe = (site: Local.Site, pending: boolean): AddSiteResult => ({
+			...withStatus(site),
+			pending,
+			credentials: { username: wpCredentials.adminUsername, password: wpCredentials.adminPassword, email: wpCredentials.adminEmail },
+		});
+
+		if (!flag(params, 'no-wait')) {
+			let site: Local.Site;
+			try {
+				site = await creation;
+			} catch (err) {
+				throw new HttpError(500, `Local could not create "${name}": ${err?.message ?? err}. Local may be showing an error dialog; the site may need to be deleted by hand.`);
+			}
+			const data = describe(backend.getSite(site.id) ?? site, false);
+			return { data, text: (format) => addSiteText(data, format) };
+		}
+
+		// Local registers the site synchronously, well before provisioning ends.
+		const deadline = Date.now() + 5000;
+		let site = backend.getSiteByDomain(domain);
+		while (!site && Date.now() < deadline) {
+			await sleep(100);
+			site = backend.getSiteByDomain(domain);
+		}
+		if (!site) {
+			await creation; // surfaces the real error when creation blew up early
+			throw new HttpError(500, `Local did not register "${name}"; check Local's log.`);
+		}
+		const data = describe(site, true);
+		return { data, text: (format) => addSiteText(data, format) };
+	};
+
+	const changeService = async (site: Local.Site, op: string, spec: string): Promise<Reply> => {
+		if (op === 'php' && !spec) {
+			throw new HttpError(400, 'change-site … php needs a version, e.g. 8.3 or 8.3.30.');
+		}
+		if ((op === 'mysql' || op === 'mariadb') && !spec) {
+			throw new HttpError(400, `change-site … ${op} needs a version, e.g. ${op === 'mysql' ? '8.4' : '10.11'}.`);
+		}
+		const role = SERVICE_ROLES[op];
+		const target = await resolveService(op, spec);
+		const current = serviceByRole(site, role);
+		const from = current ? `${current.name} ${current.version}` : '(none)';
+		const to = `${target.name} ${target.version}`;
+
+		if (current?.name === target.name && current?.version === target.version) {
+			const data: ChangeServiceResult = { ...withStatus(site), op, from, to, changed: false, downloaded: false };
+			return { data, text: (format) => changeServiceText(data, format) };
+		}
+
+		log(`change-site "${site.name}" (${site.id}): ${from} -> ${to}${target.installed ? '' : ' (download required)'}`);
+		await backend.swapService(site, role, target.name, target.version);
+
+		// Local's swap never rejects: on failure it shows a dialog, reverts the
+		// site's services and marks the site stalled. Verify the outcome instead.
+		const fresh = backend.getSite(site.id) ?? site;
+		const after = serviceByRole(fresh, role);
+		if (after?.name !== target.name || after?.version !== target.version) {
+			throw new HttpError(500, `Local could not switch "${site.name}" to ${to}; it is back on ${after ? `${after.name} ${after.version}` : 'no service'} (status ${backend.getStatus(fresh)}). Local is showing the error in a dialog and logged it.`);
+		}
+		const data: ChangeServiceResult = { ...withStatus(fresh), op, from, to, changed: true, downloaded: !target.installed };
+		return { data, text: (format) => changeServiceText(data, format) };
+	};
+
+	const changeMultisiteHandler = async (site: Local.Site, value: string, dryRun: boolean): Promise<Reply> => {
+		const target = parseNetworkTarget(value);
+		if (target === null) {
+			throw new HttpError(400, `change-site … multisite needs a mode: subdir or subdomain${value ? `, got "${value}"` : ''}.`);
+		}
+		if (target === 'off') {
+			throw new HttpError(400, 'Turning a network back into a single site is not supported: it means dropping the network tables and every sub-site. Do that by hand if you really want it.');
+		}
+		const deps: MultisiteDeps = {
+			wp: backend.wpCli,
+			getSite: backend.getSite,
+			getStatus: backend.getStatus,
+			start: backend.start,
+			restart: backend.restart,
+			updateSite: backend.updateSite,
+			syncSubdomains: backend.syncSubdomains,
+			localhostRouting: backend.localhostRouting,
+			phpDir: info.phpDir,
+			log,
+		};
+		let result: MultisiteResult;
+		try {
+			result = await changeMultisite(site, target, deps, dryRun);
+		} catch (err) {
+			if (err instanceof MultisiteError) {
+				throw new HttpError(err.status, err.message, err.extra);
+			}
+			throw err;
+		}
+		const fresh = backend.getSite(site.id) ?? site;
+		const data: MultisiteReply = { ...withStatus(fresh), ...result };
+		return { data, text: (format) => multisiteText(data, format) };
+	};
+
+	const change = async (req: Request): Promise<Reply> => {
+		const site = siteFrom(req);
+		const op = (req.params.get('op') ?? '').trim().toLowerCase();
+		const value = (req.params.get('value') ?? '').trim();
+		switch (op) {
+			case 'multisite':
+				return changeMultisiteHandler(site, value, flag(req.params, 'dry-run'));
+			case 'php': case 'mysql': case 'mariadb': case 'apache': case 'nginx':
+				return changeService(site, op, value);
+			case '':
+				throw new HttpError(400, 'change-site needs an operation: php, mysql, mariadb, apache, nginx or multisite.');
+			default:
+				throw new HttpError(400, `Unknown change-site operation "${op}". Use php, mysql, mariadb, apache, nginx or multisite.`);
+		}
+	};
+
+	const firstAdminId = async (site: Local.Site): Promise<string | null> => {
+		try {
+			const output = await backend.wpCli(site, ['user', 'list', '--role=administrator', '--field=ID', '--orderby=ID', '--order=ASC']);
+			const id = output.trim().split(/\r?\n/)[0]?.trim();
+			return id && /^\d+$/.test(id) ? id : null;
+		} catch {
+			return null;
+		}
+	};
+
+	const open = async (req: Request): Promise<Reply> => {
+		const { params } = req;
+		const site = siteFrom(req);
+		const target = ((params.get('target') ?? 'site').trim().toLowerCase() || 'site') as OpenTarget;
+		if (!['site', 'admin', 'mailpit', 'db'].includes(target)) {
+			throw new HttpError(400, `Unknown open target "${target}".`);
+		}
+		const printOnly = flag(params, 'url');
+		const autoLogin = target === 'admin' && flag(params, 'auto-login');
+
+		if (backend.getStatus(site) !== 'running') {
+			if (flag(params, 'start')) {
+				log(`start "${site.name}" (${site.id}) before opening ${target}`);
+				await backend.start(site);
+			} else if (!printOnly || target === 'db' || autoLogin) {
+				throw new HttpError(409, `"${site.name}" is ${backend.getStatus(site)}; start it first or pass --start.`);
+			}
+		}
+
+		let url: string;
+		switch (target) {
+			case 'site':
+				url = (site as any).url;
+				break;
+			case 'admin': {
+				url = (site as any).adminUrl ?? `${(site as any).url}/wp-admin/`;
+				if (autoLogin) {
+					const id = (site as any).oneClickAdminID ?? await firstAdminId(site);
+					if (!id) {
+						throw new HttpError(409, `No One-click admin user is set for "${site.name}" and no administrator could be found.`);
+					}
+					url += `${url.includes('?') ? '&' : '?'}localwp_auto_login=${id}`;
+				}
+				break;
+			}
+			case 'mailpit': {
+				const port = (site as any).services?.mailpit?.ports?.WEB?.[0];
+				if (!port) {
+					throw new HttpError(409, `Mailpit has no port for "${site.name}" yet; start the site once.`);
+				}
+				url = `http://localhost:${port}`;
+				break;
+			}
+			case 'db': {
+				if (printOnly) {
+					throw new HttpError(400, 'The database manager gets its port when it is opened, so there is no URL to print.');
+				}
+				log(`open database manager for "${site.name}" (${site.id})`);
+				await backend.openDatabase(site);
+				const data: OpenResult = { ...withStatus(site), target, openUrl: '', opened: true, autoLogin: false };
+				return { data, text: (format) => openText(data, format) };
+			}
+		}
+
+		if (!printOnly) {
+			log(`open ${target} of "${site.name}" (${site.id}): ${url}`);
+			backend.openInBrowser(url);
+		}
+		const data: OpenResult = { ...withStatus(site), target, openUrl: url, opened: !printOnly, autoLogin };
+		return { data, text: (format) => openText(data, format) };
 	};
 
 	const routes: Route[] = [
@@ -152,7 +557,7 @@ export const createBridgeServer = (backend: SiteBackend, info: BridgeInfo, log: 
 			method: 'GET',
 			pattern: /^\/(ping)?$/,
 			handler: async () => {
-				const data = { ok: true, ...info, pid: process.pid };
+				const data = { ok: true, addonVersion: info.addonVersion, localVersion: info.localVersion, pid: process.pid };
 				return { data, text: (format) => pingText(data, format) };
 			},
 		},
@@ -160,18 +565,24 @@ export const createBridgeServer = (backend: SiteBackend, info: BridgeInfo, log: 
 			method: 'GET',
 			pattern: /^\/sites$/,
 			handler: async () => {
-				const data = backend.getSites().map((site) => summarize(site, backend.getStatus(site)));
+				const data = backend.getSites().map(withStatus);
 				return { data, text: (format) => siteTable(data, format) };
 			},
 		},
+		{ method: 'POST', pattern: /^\/sites$/, handler: addSite },
+		{ method: 'GET', pattern: /^\/services$/, handler: listServices },
 		{ method: 'GET', pattern: /^\/site$/, handler: status },
 		{ method: 'GET', pattern: /^\/sites\/([^/]+)$/, handler: status },
-		{ method: 'POST', pattern: /^\/site\/(?:start)$/, handler: (req) => transition(req, 'start') },
-		{ method: 'POST', pattern: /^\/site\/(?:stop)$/, handler: (req) => transition(req, 'stop') },
-		{ method: 'POST', pattern: /^\/site\/(?:restart)$/, handler: (req) => transition(req, 'restart') },
+		{ method: 'POST', pattern: /^\/site\/start$/, handler: (req) => transition(req, 'start') },
+		{ method: 'POST', pattern: /^\/site\/stop$/, handler: (req) => transition(req, 'stop') },
+		{ method: 'POST', pattern: /^\/site\/restart$/, handler: (req) => transition(req, 'restart') },
+		{ method: 'POST', pattern: /^\/site\/change$/, handler: change },
+		{ method: 'POST', pattern: /^\/site\/open$/, handler: open },
 		{ method: 'POST', pattern: /^\/sites\/([^/]+)\/start$/, handler: (req) => transition(req, 'start') },
 		{ method: 'POST', pattern: /^\/sites\/([^/]+)\/stop$/, handler: (req) => transition(req, 'stop') },
 		{ method: 'POST', pattern: /^\/sites\/([^/]+)\/restart$/, handler: (req) => transition(req, 'restart') },
+		{ method: 'POST', pattern: /^\/sites\/([^/]+)\/change$/, handler: change },
+		{ method: 'POST', pattern: /^\/sites\/([^/]+)\/open$/, handler: open },
 	];
 
 	const send = (res: http.ServerResponse, status: number, format: Format, body: string) => {
@@ -190,17 +601,18 @@ export const createBridgeServer = (backend: SiteBackend, info: BridgeInfo, log: 
 			const body = await readBody(req);
 			if ((req.headers['content-type'] ?? '').startsWith('application/x-www-form-urlencoded')) {
 				for (const [key, value] of new URLSearchParams(body)) {
-					params.set(key, value);
+					params.append(key, value);
 				}
 			}
 			format = pickFormat(params, String(req.headers.accept ?? ''));
 
-			const route = routes.find((candidate) => candidate.pattern.test(pathname));
-			if (!route) {
+			const matching = routes.filter((candidate) => candidate.pattern.test(pathname));
+			if (!matching.length) {
 				throw new HttpError(404, `Unknown endpoint ${pathname}.`);
 			}
-			if (route.method !== method) {
-				throw new HttpError(405, `${pathname} expects ${route.method}, got ${method}.`);
+			const route = matching.find((candidate) => candidate.method === method);
+			if (!route) {
+				throw new HttpError(405, `${pathname} expects ${matching.map((candidate) => candidate.method).join(' or ')}, got ${method}.`);
 			}
 			const pathParams = pathname.match(route.pattern).slice(1);
 			const reply = await route.handler({ params, pathParams });
@@ -216,13 +628,19 @@ export const createBridgeServer = (backend: SiteBackend, info: BridgeInfo, log: 
 				send(res, status, format, JSON.stringify({ error: message, ...extra }, null, 2));
 				return;
 			}
-			const candidates = Array.isArray(extra.candidates) ? '\n' + candidateTable(extra.candidates as any[], format) : '';
-			send(res, status, format, `${message}${candidates}`);
+			const lines = [message];
+			if (Array.isArray(extra.candidates)) {
+				lines.push(candidateTable(extra.candidates as any[], format));
+			}
+			if (Array.isArray(extra.errors)) {
+				lines.push(...(extra.errors as string[]).map((line) => `  - ${line}`));
+			}
+			send(res, status, format, lines.join('\n'));
 		}
 	});
 
-	// Starting a site can take well over a minute (router restart, MySQL
-	// warm-up); never let the HTTP layer cut a legitimate request short.
+	// Creating a site or swapping a service can take minutes (downloads,
+	// WordPress install); never let the HTTP layer cut a legitimate request short.
 	server.timeout = 0;
 	server.requestTimeout = 0;
 	server.headersTimeout = 0;

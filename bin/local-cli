@@ -6,8 +6,8 @@
 # command names (list-sites, start-site, stop-site) and the same table layout,
 # so scripts written against the old tool keep working.
 #
-# Deliberately a plain POSIX shell script that needs nothing but curl: it must
-# not care which `node` is active (nvm switches, .nvmrc files, containerised
+# Deliberately a plain shell script that needs nothing but curl: it must not
+# care which `node` is active (nvm switches, .nvmrc files, containerised
 # runtimes, ...). All formatting is done by the CLI Bridge add-on inside Local,
 # reached over a Unix domain socket.
 #
@@ -26,25 +26,52 @@ EXIT_USAGE=64
 
 usage() {
 	cat <<'USAGE'
-Usage: local-cli <command> [site] [--json|--plain]
+Usage: local-cli <command> [arguments] [--json|--plain]
 
-Commands:
-  list-sites             List all sites with ID, name and status
-  site-status <site>     Show one site
-  start-site <site>      Start a site (no-op when already running)
-  stop-site <site>       Stop a site (no-op when already stopped)
-  restart-site <site>    Restart a site
-  ping                   Check that Local and the CLI Bridge add-on are reachable
-  help                   Show this help
+Sites:
+  list-sites                       List all sites with ID, name and status
+  site-status  <site>              Show one site
+  start-site   <site>              Start a site (no-op when already running)
+  stop-site    <site>              Stop a site (no-op when already stopped)
+  restart-site <site>              Restart a site
+  add-site <name> [options]        Create a site like Local's "Add Site" dialog does
+      --domain=<domain>            Default: <name><default TLD> from Local's preferences
+      --multisite=subdir|subdomain Default: single site
+      --php=<version>              e.g. 8.3 (newest 8.3.x) or 8.3.30; default: Local's preferred
+      --mysql=<version> | --mariadb=<version>
+      --apache | --nginx           Default: Local's preferred (nginx)
+      --admin-user=<name> --admin-password=<pw> --admin-email=<email>
+                                   Default: admin / admin / email from Local's preferences
+      --no-wait                    Return as soon as Local has registered the site
+  change-site <site> php <version>
+  change-site <site> mysql|mariadb <version>
+  change-site <site> apache|nginx [version]
+                                   Swap a service, like the site's "Custom" environment picker
+  change-site <site> multisite subdir|subdomain [--dry-run]
+                                   Turn a site into a network, or switch the network type
+
+Open in the browser:
+  open    <site> [--url] [--start] Open the site
+  admin   <site> [--auto-login] [--url] [--start]
+                                   Open wp-admin; --auto-login uses Local's One-click admin user
+  db      <site> [--start]         Open the bundled database manager (AdminNeo); alias: adminneo
+  mailpit <site> [--url] [--start] Open Mailpit
+      --url prints the URL instead of opening it; --start starts a halted site first
+
+Other:
+  services [php|db|http]           List the service versions Local can install
+  ping                             Check that Local and the CLI Bridge add-on are reachable
+  help                             Show this help
 
 <site> is a site ID, domain or name (case-insensitive); a unique prefix of
-the name or domain also works. Quote names containing spaces.
+the name or domain also works. Quote names containing spaces. When <site> is
+omitted, $LOCAL_SITE_ID, then $LOCAL_SITE_NAME, is used.
 
 Options:
   --json    Print the raw JSON response (for scripts)
-  --plain   Tab-separated ID, name, domain, status without borders (for cut/awk)
+  --plain   Tab-separated fields without borders (for cut/awk)
 
-The table output matches the deprecated @getflywheel/local-cli (ID, Name,
+The list-sites table matches the deprecated @getflywheel/local-cli (ID, Name,
 Status) so existing scripts that parse it keep working.
 
 Exit codes: 0 ok, 1 command failed, 2 Local/bridge unreachable, 64 usage error.
@@ -52,43 +79,116 @@ Environment: LOCAL_CLI_BRIDGE_SOCKET overrides the socket path.
 USAGE
 }
 
+die_usage() {
+	printf 'local-cli: %s\n\n' "$1" >&2
+	usage >&2
+	exit $EXIT_USAGE
+}
+
+# ---------------------------------------------------------------------------
+# Argument parsing: positionals go to $1..$n (via POS_*), every --key=value or
+# --flag is forwarded to the bridge as a form field, except the output format.
+# ---------------------------------------------------------------------------
 FORMAT=table
-COMMAND=""
-SITE=""
+POS_COUNT=0
+FIELDS=()          # "key=value" pairs forwarded to the bridge
 for arg in "$@"; do
 	case "$arg" in
-		--json) FORMAT=json ;;
+		--json)  FORMAT=json ;;
 		--plain) FORMAT=plain ;;
 		--help|-h) usage; exit 0 ;;
-		--*) printf 'local-cli: unknown option "%s"\n\n' "$arg" >&2; usage >&2; exit $EXIT_USAGE ;;
+		--*=*)
+			key="${arg#--}"; key="${key%%=*}"
+			FIELDS+=("$key=${arg#--*=}")
+			;;
+		--*)
+			FIELDS+=("${arg#--}=1")
+			;;
 		*)
-			if [ -z "$COMMAND" ]; then
-				COMMAND="$arg"
-			elif [ -z "$SITE" ]; then
-				SITE="$arg"
-			else
-				# Names may contain spaces; be forgiving when the user forgot to quote.
-				SITE="$SITE $arg"
-			fi
+			POS_COUNT=$((POS_COUNT + 1))
+			eval "POS_$POS_COUNT=\$arg"
 			;;
 	esac
 done
 
-case "${COMMAND:-help}" in
+pos() { eval "printf '%s' \"\${POS_$1:-}\""; }
+
+COMMAND="$(pos 1)"
+[ -z "$COMMAND" ] && COMMAND=help
+
+# Everything after the command, joined with spaces (site names may contain
+# spaces and people forget to quote).
+rest_from() {
+	local i="$1" out=""
+	while [ "$i" -le "$POS_COUNT" ]; do
+		out="${out:+$out }$(pos "$i")"
+		i=$((i + 1))
+	done
+	printf '%s' "$out"
+}
+
+site_or_env() {
+	local site="$1"
+	[ -z "$site" ] && site="${LOCAL_SITE_ID:-${LOCAL_SITE_NAME:-}}"
+	printf '%s' "$site"
+}
+
+METHOD=GET
+ENDPOINT=""
+SITE=""
+NEEDS_SITE=0
+
+case "$COMMAND" in
 	help)         usage; exit 0 ;;
-	ping)         METHOD=GET;  ENDPOINT=/ping;         NEEDS_SITE=0 ;;
-	list-sites)   METHOD=GET;  ENDPOINT=/sites;        NEEDS_SITE=0 ;;
-	site-status)  METHOD=GET;  ENDPOINT=/site;         NEEDS_SITE=1 ;;
-	start-site)   METHOD=POST; ENDPOINT=/site/start;   NEEDS_SITE=1 ;;
-	stop-site)    METHOD=POST; ENDPOINT=/site/stop;    NEEDS_SITE=1 ;;
-	restart-site) METHOD=POST; ENDPOINT=/site/restart; NEEDS_SITE=1 ;;
-	*) printf 'local-cli: unknown command "%s"\n\n' "$COMMAND" >&2; usage >&2; exit $EXIT_USAGE ;;
+	ping)         ENDPOINT=/ping ;;
+	list-sites)   ENDPOINT=/sites ;;
+	services)     ENDPOINT=/services; [ -n "$(pos 2)" ] && FIELDS+=("role=$(pos 2)") ;;
+	site-status)  ENDPOINT=/site;                NEEDS_SITE=1; SITE="$(rest_from 2)" ;;
+	start-site)   METHOD=POST; ENDPOINT=/site/start;   NEEDS_SITE=1; SITE="$(rest_from 2)" ;;
+	stop-site)    METHOD=POST; ENDPOINT=/site/stop;    NEEDS_SITE=1; SITE="$(rest_from 2)" ;;
+	restart-site) METHOD=POST; ENDPOINT=/site/restart; NEEDS_SITE=1; SITE="$(rest_from 2)" ;;
+	add-site)
+		METHOD=POST; ENDPOINT=/sites
+		NAME="$(rest_from 2)"
+		[ -z "$NAME" ] && die_usage "add-site needs a site name"
+		FIELDS+=("name=$NAME")
+		# --apache / --nginx arrive as "apache=1" / "nginx=1"; the bridge wants webserver=<name>.
+		for i in ${FIELDS[@]+"${!FIELDS[@]}"}; do
+			case "${FIELDS[$i]}" in
+				apache=1) FIELDS[$i]="webserver=apache" ;;
+				nginx=1)  FIELDS[$i]="webserver=nginx" ;;
+			esac
+		done
+		;;
+	change-site)
+		METHOD=POST; ENDPOINT=/site/change; NEEDS_SITE=1
+		SITE="$(pos 2)"
+		OP="$(pos 3)"
+		VALUE="$(pos 4)"
+		MAX_POS=4
+		# `change-site php 8.3` with the site in $LOCAL_SITE_ID / $LOCAL_SITE_NAME.
+		case "$SITE" in
+			php|mysql|mariadb|apache|nginx|multisite)
+				if [ -n "${LOCAL_SITE_ID:-}${LOCAL_SITE_NAME:-}" ] && [ "$POS_COUNT" -le 3 ]; then
+					VALUE="$OP"; OP="$SITE"; SITE=""; MAX_POS=3
+				fi
+				;;
+		esac
+		[ -z "$OP" ] && die_usage "change-site needs an operation: php, mysql, mariadb, apache, nginx or multisite"
+		[ "$POS_COUNT" -gt "$MAX_POS" ] && die_usage "too many arguments for change-site (quote site names containing spaces)"
+		FIELDS+=("op=$OP" "value=$VALUE")
+		;;
+	open)          METHOD=POST; ENDPOINT=/site/open; NEEDS_SITE=1; SITE="$(rest_from 2)"; FIELDS+=("target=site") ;;
+	admin)         METHOD=POST; ENDPOINT=/site/open; NEEDS_SITE=1; SITE="$(rest_from 2)"; FIELDS+=("target=admin") ;;
+	db|adminneo)   METHOD=POST; ENDPOINT=/site/open; NEEDS_SITE=1; SITE="$(rest_from 2)"; FIELDS+=("target=db") ;;
+	mailpit)       METHOD=POST; ENDPOINT=/site/open; NEEDS_SITE=1; SITE="$(rest_from 2)"; FIELDS+=("target=mailpit") ;;
+	*) die_usage "unknown command \"$COMMAND\"" ;;
 esac
 
-if [ "$NEEDS_SITE" -eq 1 ] && [ -z "$SITE" ]; then
-	printf 'local-cli: %s needs a site ID, domain or name\n\n' "$COMMAND" >&2
-	usage >&2
-	exit $EXIT_USAGE
+if [ "$NEEDS_SITE" -eq 1 ]; then
+	SITE="$(site_or_env "$SITE")"
+	[ -z "$SITE" ] && die_usage "$COMMAND needs a site ID, domain or name (or set LOCAL_SITE_ID / LOCAL_SITE_NAME)"
+	FIELDS+=("site=$SITE")
 fi
 
 if ! command -v curl >/dev/null 2>&1; then
@@ -96,13 +196,15 @@ if ! command -v curl >/dev/null 2>&1; then
 	exit $EXIT_UNREACHABLE
 fi
 
-# The site reference travels as a form field so curl handles the URL-encoding
-# (-G turns it into a query string for GET requests).
+# Every field travels as a form field so curl handles the URL-encoding
+# (-G turns them into a query string for GET requests).
 set -- --silent --show-error --unix-socket "$SOCKET" --max-time 0 \
 	--request "$METHOD" --header "Accept: text/plain" \
 	--write-out '\n%{http_code}' --data-urlencode "format=$FORMAT"
 [ "$METHOD" = "GET" ] && set -- "$@" --get
-[ "$NEEDS_SITE" -eq 1 ] && set -- "$@" --data-urlencode "site=$SITE"
+for field in ${FIELDS[@]+"${FIELDS[@]}"}; do
+	set -- "$@" --data-urlencode "$field"
+done
 
 RESPONSE=$(curl "$@" "http://local$ENDPOINT" 2>&1)
 CURL_EXIT=$?

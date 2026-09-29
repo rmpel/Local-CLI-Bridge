@@ -11,7 +11,7 @@
 # build.sh — package CLI Bridge as a distributable Local (LocalWP) add-on.
 #
 # The add-on has no runtime npm dependencies, so the archive is just the
-# compiled lib/, the bin/ command, the sources and the docs, unpacking to a
+# compiled lib/, the bin/ command, the php/ helpers, the sources and the docs, unpacking to a
 # top-level folder named after the package (the same name install.sh links).
 #
 set -euo pipefail
@@ -40,7 +40,7 @@ rm -rf "$STAGE" "$ZIP"
 mkdir -p "$PKG_DIR" "$DIST"
 
 echo "==> Staging files"
-cp -R lib src bin scripts "$PKG_DIR/"
+cp -R lib src bin php scripts "$PKG_DIR/"
 cp package.json package-lock.json icon.svg README.md CHANGELOG.md LICENSE "$PKG_DIR/"
 
 echo "==> Creating archive"
