@@ -1,14 +1,14 @@
 {
 	"name": "local-cli-bridge",
 	"productName": "CLI Bridge",
-	"version": "1.0.0",
+	"version": "1.1.0",
 	"author": "Remon Pel",
 	"keywords": [
 		"local-addon"
 	],
 	"bgColor": "#eef3e9",
 	"icon": "icon.svg",
-	"description": "Control Local from the command line: list, start, stop and restart sites through a `localwp` command, without the deprecated GraphQL-based local-cli.",
+	"description": "Control Local from the command line: list, start, stop, restart, create and reconfigure sites, and open their admin, Mailpit and database manager through a `local-cli` command, without the deprecated GraphQL-based local-cli.",
 	"main": "lib/main.js",
 	"license": "GPL-3.0-or-later",
 	"scripts": {

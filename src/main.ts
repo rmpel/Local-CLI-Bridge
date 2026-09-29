@@ -8,34 +8,72 @@ import { createBridgeServer, SiteBackend } from './server';
 
 /**
  * CLI Bridge — a tiny HTTP-over-Unix-socket server inside Local's main
- * process, driven by the `localwp` command in bin/. It replaces the
+ * process, driven by the `local-cli` command in bin/. It replaces the
  * deprecated GraphQL-based local-cli for the day-to-day automation needs:
- * list, start, stop and restart sites.
+ * list, start, stop, restart, create and reconfigure sites, and open their
+ * front-end, admin, Mailpit and database manager.
  */
 export default function (context: LocalMain.AddonMainContext): void {
 	const { electron, environment } = context;
-	const { siteData, siteProcessManager, localLogger } = LocalMain.getServiceContainer().cradle;
+	const {
+		siteData, siteProcessManager, localLogger, addSite, siteProvisioner, lightningServices,
+		adminer, browserManager, wpCli, multiSite,
+	} = LocalMain.getServiceContainer().cradle;
 
 	const logger = localLogger.child({ thread: 'main', addon: ADDON_NAME });
 	const log = (msg: string) => logger.info(msg);
 
 	const backend: SiteBackend = {
 		getSites: () => Object.values(siteData.getSites()) as Local.Site[],
+		getSite: (id) => siteData.getSite(id),
+		getSiteByDomain: (domain) => siteData.getSiteByProperty('domain', domain),
 		getStatus: (site) => siteProcessManager.getSiteStatus(site),
 		start: (site) => siteProcessManager.start(site),
 		stop: (site) => siteProcessManager.stop(site),
 		restart: (site) => siteProcessManager.restart(site),
+		getServices: async (role) => {
+			const services = await lightningServices.getServices(role as any);
+			const catalog: Record<string, Record<string, { registered: boolean }>> = {};
+			for (const [name, versions] of Object.entries<any>(services ?? {})) {
+				catalog[name] = {};
+				for (const [version, service] of Object.entries<any>(versions ?? {})) {
+					catalog[name][version] = { registered: service?.registered === true };
+				}
+			}
+			return catalog;
+		},
+		getNewSiteDefaults: () => {
+			try {
+				return LocalMain.UserData.get('settings-new-site-defaults', {}) ?? {};
+			} catch (err) {
+				logger.warn(`Could not read the new-site defaults, using Local's built-ins: ${err?.message ?? err}`);
+				return {};
+			}
+		},
+		addSite: (input) => addSite.addSite(input as any),
+		swapService: (site, role, serviceName, version) => siteProvisioner.swapService(site, role as any, serviceName, version),
+		openInBrowser: (url) => browserManager.openInBrowser(url),
+		openDatabase: (site) => adminer.open(site),
+		wpCli: async (site, args) => (await wpCli.run(site, args)) ?? '',
+		updateSite: (id, patch) => siteData.updateSite(id, patch as any),
+		syncSubdomains: (site) => multiSite.syncSubdomains(site),
+		localhostRouting: () => !!(global as any).localhostRouting,
 	};
 
+	const addonRoot = path.join(__dirname, '..');
 	const addonVersion = (() => {
 		try {
-			return JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'package.json'), 'utf8')).version;
+			return JSON.parse(fs.readFileSync(path.join(addonRoot, 'package.json'), 'utf8')).version;
 		} catch {
 			return 'unknown';
 		}
 	})();
 
-	const server = createBridgeServer(backend, { addonVersion, localVersion: String(environment.version) }, log);
+	const server = createBridgeServer(backend, {
+		addonVersion,
+		localVersion: String(environment.version),
+		phpDir: path.join(addonRoot, 'php'),
+	}, log);
 
 	const removeSocketArtifacts = () => {
 		for (const file of [INFO_FILE, process.platform === 'win32' ? null : SOCKET_PATH]) {
