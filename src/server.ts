@@ -4,10 +4,13 @@ import * as path from 'path';
 import type * as Local from '@getflywheel/local';
 import {
 	CONTENT_TYPES, Format, addSiteText, candidateTable, changeServiceText, multisiteText, openText, pingText,
-	servicesText, siteTable, transitionText,
+	servicesText, siteTable, sslText, transitionText,
 } from './format';
 import { BUILT_IN_SITE_DEFAULTS, NewSiteDefaults, deriveDomain, expandHome, formatSiteNicename, validateNewSite } from './new-site';
 import { MS_VALUES, MultisiteDeps, MultisiteError, MultisiteResult, NetworkType, changeMultisite, modeFromSite, parseNetworkTarget } from './multisite';
+import {
+	Platform, TrustCommand, buildTrustScript, commandLine, findOnPath, inSystemKeychain, trustCommands, verifiesForSsl,
+} from './ssl';
 import { SERVICE_ROLES, ServiceCatalog, ServiceRole, isValidVersionSpec, resolveVersion } from './versions';
 
 /**
@@ -34,6 +37,16 @@ export interface SiteBackend {
 	updateSite(id: string, patch: Record<string, unknown>): void;
 	syncSubdomains(site: Local.Site): Promise<void>;
 	localhostRouting(): boolean;
+	/** Path of the site's certificate in Local's router folder, whether or not it exists yet. */
+	siteCertPath(site: Local.Site): string;
+	/** Generate the site's certificate when it does not exist yet, as Local does on first start. */
+	ensureSiteCert(site: Local.Site): Promise<void>;
+	/** Local's own trust check: the certificate is present in the system store. */
+	certTrustedByLocal(site: Local.Site): Promise<boolean>;
+	/** Tell Local's UI the certificate is trusted, so the SSL tab shows "Trusted". */
+	notifyCertTrusted(site: Local.Site): void;
+	/** Press Local's Trust button: whatever handles the trustSiteCert channel, Local or an add-on that took it over. */
+	trustViaLocal(site: Local.Site): Promise<void>;
 }
 
 export interface AddSiteInput {
@@ -93,6 +106,30 @@ export interface ChangeServiceResult extends SiteSummary {
 }
 
 export type MultisiteReply = SiteSummary & MultisiteResult;
+
+export interface SslStatus extends SiteSummary {
+	certPath: string;
+	keyPath: string;
+	trusted: boolean;
+	/** macOS only: the certificate sits in the System keychain, trusted for SSL or not. Null elsewhere. */
+	inKeychain: boolean | null;
+	platform: Platform;
+	/** The shell lines that trust the certificate, in order; empty when this platform has no recipe. */
+	commands: string[];
+	/** Why `commands` is empty, when it is. */
+	commandsError: string;
+}
+
+export interface TrustResult extends SslStatus {
+	via: 'shell' | 'local';
+	changed: boolean;
+	/** Local's own flow was triggered but has not finished yet (an add-on opened a Terminal, say). */
+	pending: boolean;
+}
+
+export interface TrustScript extends SslStatus {
+	script: string;
+}
 
 export class HttpError extends Error {
 	constructor(public status: number, message: string, public extra: Record<string, unknown> = {}) {
@@ -552,6 +589,97 @@ export const createBridgeServer = (backend: SiteBackend, info: BridgeInfo, log: 
 		return { data, text: (format) => openText(data, format) };
 	};
 
+	/**
+	 * Where the certificate stands. On macOS "trusted" means it verifies under
+	 * the SSL policy, which is what browsers care about; Local only checks the
+	 * keychain for the certificate and so calls its own silently failed trusts
+	 * trusted. Elsewhere Local's check is the one that exists.
+	 */
+	const sslStatus = async (site: Local.Site): Promise<SslStatus> => {
+		const domain = (site as any).domain as string;
+		const certPath = backend.siteCertPath(site);
+		const keyPath = certPath.replace(/\.crt$/, '.key');
+		if (!fs.existsSync(certPath) || !fs.existsSync(keyPath)) {
+			log(`generate certificate for "${site.name}" (${site.id})`);
+			await backend.ensureSiteCert(site);
+		}
+		if (!fs.existsSync(certPath)) {
+			throw new HttpError(409, `Local has no certificate for "${domain}" (expected ${certPath}); start the site once and try again.`);
+		}
+		const platform = process.platform as Platform;
+		let trusted: boolean;
+		let inKeychain: boolean | null = null;
+		if (platform === 'darwin') {
+			inKeychain = await inSystemKeychain(certPath);
+			trusted = inKeychain && await verifiesForSsl(certPath, domain);
+		} else {
+			trusted = await backend.certTrustedByLocal(site);
+		}
+		let commands: TrustCommand[] = [];
+		let commandsError = '';
+		try {
+			commands = trustCommands(platform, certPath, domain, { certutil: findOnPath('certutil') });
+		} catch (err) {
+			commandsError = err?.message ?? String(err);
+		}
+		return { ...withStatus(site), certPath, keyPath, trusted, inKeychain, platform, commands: commands.map(commandLine), commandsError };
+	};
+
+	const ssl = async (req: Request): Promise<Reply> => {
+		const data = await sslStatus(siteFrom(req));
+		return { data, text: (format) => sslText(data, format) };
+	};
+
+	/** The script the client runs in its own terminal; sudo prompts there. */
+	const sslScript = async (req: Request): Promise<Reply> => {
+		const site = siteFrom(req);
+		const status = await sslStatus(site);
+		if (status.platform === 'win32') {
+			throw new HttpError(409, `There is no shell recipe for Windows. Run this in an elevated prompt:\n  ${status.commands.join('\n  ')}\nor pass --gui to let Local ask for elevation.`);
+		}
+		if (!status.commands.length) {
+			throw new HttpError(409, status.commandsError || 'No trust commands are known for this platform.');
+		}
+		const commands = trustCommands(status.platform, status.certPath, status.domain, { certutil: findOnPath('certutil') });
+		const data: TrustScript = { ...status, script: buildTrustScript(status.domain, status.certPath, commands) };
+		return { data, text: () => data.script };
+	};
+
+	/**
+	 * `gui=1`: press Local's Trust button. Without it: the client has just run
+	 * the script, so re-check and, when it worked, flip Local's SSL tab to
+	 * "Trusted".
+	 */
+	const sslTrust = async (req: Request): Promise<Reply> => {
+		const site = siteFrom(req);
+		const gui = flag(req.params, 'gui');
+		let before = await sslStatus(site);
+		// Fresh trust settings can take a moment to show up; the client has just
+		// run sudo, so give macOS a few seconds before calling it a failure.
+		for (let attempt = 0; !gui && !before.trusted && attempt < 5; attempt++) {
+			await sleep(1000);
+			before = await sslStatus(site);
+		}
+		if (before.trusted) {
+			backend.notifyCertTrusted(site);
+			const data: TrustResult = { ...before, via: gui ? 'local' : 'shell', changed: !flag(req.params, 'already'), pending: false };
+			return { data, text: (format) => sslText(data, format) };
+		}
+		if (!gui) {
+			throw new HttpError(409, before.inKeychain === true
+				? `The certificate for "${before.domain}" is in the System keychain but still not trusted for SSL.`
+				: `The certificate for "${before.domain}" is still not trusted.`);
+		}
+		log(`trust certificate of "${site.name}" (${site.id}) through Local's own Trust flow`);
+		await backend.trustViaLocal(site);
+		const after = await sslStatus(site);
+		if (after.trusted) {
+			backend.notifyCertTrusted(site);
+		}
+		const data: TrustResult = { ...after, via: 'local', changed: after.trusted, pending: !after.trusted };
+		return { data, text: (format) => sslText(data, format) };
+	};
+
 	const routes: Route[] = [
 		{
 			method: 'GET',
@@ -578,6 +706,12 @@ export const createBridgeServer = (backend: SiteBackend, info: BridgeInfo, log: 
 		{ method: 'POST', pattern: /^\/site\/restart$/, handler: (req) => transition(req, 'restart') },
 		{ method: 'POST', pattern: /^\/site\/change$/, handler: change },
 		{ method: 'POST', pattern: /^\/site\/open$/, handler: open },
+		{ method: 'GET', pattern: /^\/site\/ssl$/, handler: ssl },
+		{ method: 'GET', pattern: /^\/site\/ssl\/script$/, handler: sslScript },
+		{ method: 'POST', pattern: /^\/site\/ssl\/trust$/, handler: sslTrust },
+		{ method: 'GET', pattern: /^\/sites\/([^/]+)\/ssl$/, handler: ssl },
+		{ method: 'GET', pattern: /^\/sites\/([^/]+)\/ssl\/script$/, handler: sslScript },
+		{ method: 'POST', pattern: /^\/sites\/([^/]+)\/ssl\/trust$/, handler: sslTrust },
 		{ method: 'POST', pattern: /^\/sites\/([^/]+)\/start$/, handler: (req) => transition(req, 'start') },
 		{ method: 'POST', pattern: /^\/sites\/([^/]+)\/stop$/, handler: (req) => transition(req, 'stop') },
 		{ method: 'POST', pattern: /^\/sites\/([^/]+)\/restart$/, handler: (req) => transition(req, 'restart') },

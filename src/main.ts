@@ -17,8 +17,38 @@ export default function (context: LocalMain.AddonMainContext): void {
 	const { electron, environment } = context;
 	const {
 		siteData, siteProcessManager, localLogger, addSite, siteProvisioner, lightningServices,
-		adminer, browserManager, wpCli, multiSite,
+		adminer, browserManager, wpCli, multiSite, x509Cert, sendIPCEvent,
 	} = LocalMain.getServiceContainer().cradle;
+
+	// Local's X509CertService keeps the cert location and generator as statics;
+	// the cradle hands out the instance, so reach them through its constructor.
+	const X509 = x509Cert.constructor as any;
+	const certsDir = path.join(electron.app.getPath('userData'), 'run', 'router', 'nginx', 'certs');
+
+	// The channel the SSL tab's Trust button sends to. The "Trust SSL — macOS
+	// Fix" add-on replaces Local's listener there, so emitting on the channel
+	// reaches whichever flow the user has installed; a direct trustCert() call
+	// would bypass the add-on and run the broken built-in one.
+	const TRUST_CHANNEL = 'trustSiteCert';
+	const trustViaLocal = (site: Local.Site): Promise<void> => new Promise((resolve, reject) => {
+		if (electron.ipcMain.listenerCount(TRUST_CHANNEL) === 0) {
+			x509Cert.trustCert(site).then(resolve, reject);
+			return;
+		}
+		const replyChannels = { successReplyChannel: `${ADDON_NAME}:trust-ok`, errorReplyChannel: `${ADDON_NAME}:trust-error` };
+		const event = {
+			reply: (channel: string, payload: any) => channel === replyChannels.errorReplyChannel
+				? reject(new Error(payload?.message ?? 'Local could not trust the certificate.'))
+				: resolve(),
+		};
+		let siteJson: unknown = site;
+		try {
+			siteJson = JSON.parse(JSON.stringify(site));
+		} catch {
+			// the listeners can cope with the model itself
+		}
+		electron.ipcMain.emit(TRUST_CHANNEL, event, replyChannels, siteJson);
+	});
 
 	const logger = localLogger.child({ thread: 'main', addon: ADDON_NAME });
 	const log = (msg: string) => logger.info(msg);
@@ -58,6 +88,27 @@ export default function (context: LocalMain.AddonMainContext): void {
 		updateSite: (id, patch) => siteData.updateSite(id, patch as any),
 		syncSubdomains: (site) => multiSite.syncSubdomains(site),
 		localhostRouting: () => !!(global as any).localhostRouting,
+		siteCertPath: (site) => {
+			try {
+				const fromLocal = X509.getSiteCertPath?.(site);
+				if (typeof fromLocal === 'string' && fromLocal) {
+					return fromLocal;
+				}
+			} catch {
+				// fall through to the known location
+			}
+			return path.join(certsDir, `${(site as any).domain}.crt`);
+		},
+		ensureSiteCert: async (site) => {
+			if (typeof X509.generateSiteCert === 'function') {
+				await X509.generateSiteCert(site);
+				return;
+			}
+			await x509Cert.certificateTrustStatus(site); // generates the certificate when it is missing
+		},
+		certTrustedByLocal: async (site) => !!(await x509Cert.certificateTrustStatus(site)),
+		notifyCertTrusted: (site) => sendIPCEvent('siteCertTrusted', site, true),
+		trustViaLocal,
 	};
 
 	const addonRoot = path.join(__dirname, '..');

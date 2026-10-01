@@ -71,6 +71,9 @@ local-cli open    my-site [--url] [--start]
 local-cli admin   my-site [--auto-login] [--url] [--start]
 local-cli db      my-site            (alias: adminneo)
 local-cli mailpit my-site [--url] [--start]
+
+local-cli trust-ssl  my-site [--print | --gui]
+local-cli ssl-status my-site
 ```
 
 A site can be referenced by its ID, its domain or its name (case-insensitive).
@@ -164,6 +167,55 @@ opens). `admin --auto-login` appends Local's One-click admin login for the
 user chosen on the site's Overview tab, or the first administrator when none
 is chosen.
 
+### trust-ssl, ssl-status
+
+`trust-ssl` trusts the site's SSL certificate system-wide, the job of the
+"Trust" button on the site's SSL tab, without leaving the terminal you are in:
+
+```
+$ local-cli trust-ssl my-site
+Trusting the SSL certificate for my-site.test:
+  /Users/me/Library/Application Support/Local/run/router/nginx/certs/my-site.test.crt
+This needs administrator rights; sudo may ask for your password.
+
+$ sudo security add-trusted-cert -d -r trustRoot -p ssl -k /Library/Keychains/System.keychain '/Users/me/…/my-site.test.crt'
+Password:
+
+my-site (EE0cNsiD3): the certificate for my-site.test is now trusted.
+  Certificate: /Users/me/Library/Application Support/Local/run/router/nginx/certs/my-site.test.crt
+```
+
+The bridge hands the client a short script with the platform's trust recipe
+(macOS: `security add-trusted-cert … -p ssl`; Linux: copy into the system CA
+folder, refresh the store, and `certutil` for Chromium/Firefox NSS databases
+when present), the client runs it right there so `sudo` prompts inline, and the
+bridge then re-checks and flips Local's SSL tab to "Trusted". A certificate that
+does not exist yet (a site never started) is generated first, as Local does.
+
+Why not call Local's own trust flow? On modern macOS Local runs that command
+through a background sudo helper, and in that non-interactive context macOS
+puts the certificate in the System keychain but never writes the trust
+settings: browsers keep warning while Local's button says "Trusted". Typing the
+command in a terminal works, which is what the companion add-on
+[Trust SSL — macOS Fix](https://github.com/rmpel/Local-Trust-Ssl-MacOS) does by
+opening a Terminal window from the button. The CLI already has a terminal.
+
+- `--print` prints the script instead of running it (for a machine without
+  `sudo`, or to see what would happen).
+- `--gui` presses Local's Trust button instead: whatever handles it, Local's
+  built-in sudo prompt or the Trust SSL add-on's Terminal window. The command
+  returns once that flow reports back; when the certificate is not trusted by
+  then (the add-on's Terminal is still waiting for you), it says so.
+- On Windows there is no `sudo` for the script to use; `trust-ssl` prints the
+  `certutil -addstore` command to run in an elevated prompt and suggests `--gui`.
+
+`ssl-status` reports whether the certificate is trusted. On macOS "trusted"
+means it verifies under the SSL policy for the site's domain
+(`security verify-cert -p ssl`), which is stricter than Local's own check and
+tells apart the "in the keychain but not trusted" state a failed Trust from
+Local's window leaves behind. `--plain` prints `ID  Name  Domain  State  Cert`
+with the state `trusted`, `untrusted` or `in-keychain`.
+
 ## How it works
 
 - On launch the add-on listens on `~/.local-cli-bridge/bridge.sock` (a named
@@ -191,6 +243,9 @@ is chosen.
   | POST   | `/sites/{ref}/restart`    | Restart                                                            |
   | POST   | `/sites/{ref}/change`     | `op=php\|mysql\|mariadb\|apache\|nginx\|multisite`, `value=…`, `dry-run=1` |
   | POST   | `/sites/{ref}/open`       | `target=site\|admin\|mailpit\|db`, `auto-login=1`, `url=1`, `start=1`  |
+  | GET    | `/sites/{ref}/ssl`        | Certificate path, trust state and the trust commands for this platform |
+  | GET    | `/sites/{ref}/ssl/script` | The trust recipe as a bash script (text), for the client to run         |
+  | POST   | `/sites/{ref}/ssl/trust`  | Re-check and tell Local's UI; `gui=1` presses Local's Trust button      |
 
   You can call it with curl directly as well:
   `curl --unix-socket ~/.local-cli-bridge/bridge.sock -X POST http://local/sites/wp/start`
@@ -202,6 +257,13 @@ is chosen.
   database manager is Local's `adminer` service and URLs open through Local's
   `browserManager`. WordPress work (multisite conversion, admin lookup) runs
   through Local's bundled WP-CLI (`wpCli` service), using the site's own PHP.
+- `trust-ssl` reads the certificate from Local's router folder (`x509Cert`
+  service, generating it when missing), builds the same commands Local's
+  `localcert` package would, with the `-p ssl` policy on macOS, and lets the
+  shell client run them. The result is reported to Local's window over the
+  `siteCertTrusted` IPC event, the one its SSL tab listens to. `--gui` emits
+  on the `trustSiteCert` channel the Trust button uses, so an add-on that took
+  that channel over (Trust SSL — macOS Fix) handles it, not Local's built-in.
 - The multisite helpers in `php/` are run with `wp eval-file`:
   `network-htaccess.php` asks WordPress core (`network_step2()`) for the
   network's Apache rules, `network-switch.php` rewrites sub-sites between
@@ -231,7 +293,14 @@ for "Install from disk".
 
 - `engines.local-by-flywheel: >=9.0.0` — uses `siteData`, `siteProcessManager`,
   `addSite`, `siteProvisioner`, `lightningServices`, `adminer`, `browserManager`,
-  `wpCli`, `multiSite` and `localLogger` from Local's service container, all
-  present with the same signatures in the Local 9 typings (tested on 10.1.2).
+  `wpCli`, `multiSite`, `x509Cert`, `sendIPCEvent` and `localLogger` from
+  Local's service container, all present with the same signatures in the
+  Local 9 typings (tested on 10.1.2).
+- `trust-ssl` relies on Local keeping site certificates at
+  `<userData>/run/router/nginx/certs/<domain>.crt` (asked from Local first,
+  falling back to that path) and on the `trustSiteCert` / `siteCertTrusted`
+  IPC channels behind the SSL tab. Verified on Local 10.1.2 / macOS; the Linux
+  recipe mirrors Local's and is untested here, Windows gets the command to run
+  by hand.
 - The bundled database manager is AdminNeo in Local 10 (Adminer in Local 9);
   `local-cli db` opens whichever Local ships.

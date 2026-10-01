@@ -58,6 +58,12 @@ Open in the browser:
   mailpit <site> [--url] [--start] Open Mailpit
       --url prints the URL instead of opening it; --start starts a halted site first
 
+SSL:
+  trust-ssl  <site> [--print|--gui] Trust the site's certificate; sudo asks for your password
+                                   right here, no new window. --print shows the commands instead,
+                                   --gui presses the Trust button in Local's window
+  ssl-status <site>                Is the site's certificate trusted?
+
 Other:
   services [php|db|http]           List the service versions Local can install
   ping                             Check that Local and the CLI Bridge add-on are reachable
@@ -133,10 +139,19 @@ site_or_env() {
 	printf '%s' "$site"
 }
 
+has_field() {
+	local wanted="$1" field
+	for field in ${FIELDS[@]+"${FIELDS[@]}"}; do
+		[ "$field" = "$wanted" ] && return 0
+	done
+	return 1
+}
+
 METHOD=GET
 ENDPOINT=""
 SITE=""
 NEEDS_SITE=0
+TRUST_FLOW=0
 
 case "$COMMAND" in
 	help)         usage; exit 0 ;;
@@ -182,6 +197,17 @@ case "$COMMAND" in
 	admin)         METHOD=POST; ENDPOINT=/site/open; NEEDS_SITE=1; SITE="$(rest_from 2)"; FIELDS+=("target=admin") ;;
 	db|adminneo)   METHOD=POST; ENDPOINT=/site/open; NEEDS_SITE=1; SITE="$(rest_from 2)"; FIELDS+=("target=db") ;;
 	mailpit)       METHOD=POST; ENDPOINT=/site/open; NEEDS_SITE=1; SITE="$(rest_from 2)"; FIELDS+=("target=mailpit") ;;
+	ssl-status)    ENDPOINT=/site/ssl; NEEDS_SITE=1; SITE="$(rest_from 2)" ;;
+	trust-ssl)
+		NEEDS_SITE=1; SITE="$(rest_from 2)"
+		if has_field print=1; then
+			ENDPOINT=/site/ssl/script
+		elif has_field gui=1; then
+			METHOD=POST; ENDPOINT=/site/ssl/trust
+		else
+			TRUST_FLOW=1
+		fi
+		;;
 	*) die_usage "unknown command \"$COMMAND\"" ;;
 esac
 
@@ -196,32 +222,73 @@ if ! command -v curl >/dev/null 2>&1; then
 	exit $EXIT_UNREACHABLE
 fi
 
+# bridge <method> <endpoint> <format>: one request to the bridge. Sets STATUS
+# (HTTP status) and BODY; exits when Local cannot be reached at all.
 # Every field travels as a form field so curl handles the URL-encoding
 # (-G turns them into a query string for GET requests).
-set -- --silent --show-error --unix-socket "$SOCKET" --max-time 0 \
-	--request "$METHOD" --header "Accept: text/plain" \
-	--write-out '\n%{http_code}' --data-urlencode "format=$FORMAT"
-[ "$METHOD" = "GET" ] && set -- "$@" --get
-for field in ${FIELDS[@]+"${FIELDS[@]}"}; do
-	set -- "$@" --data-urlencode "$field"
-done
+bridge() {
+	local method="$1" endpoint="$2" format="$3" field response curl_exit
+	set -- --silent --show-error --unix-socket "$SOCKET" --max-time 0 \
+		--request "$method" --header "Accept: text/plain" \
+		--write-out '\n%{http_code}' --data-urlencode "format=$format"
+	[ "$method" = "GET" ] && set -- "$@" --get
+	for field in ${FIELDS[@]+"${FIELDS[@]}"}; do
+		set -- "$@" --data-urlencode "$field"
+	done
 
-RESPONSE=$(curl "$@" "http://local$ENDPOINT" 2>&1)
-CURL_EXIT=$?
+	response=$(curl "$@" "http://local$endpoint" 2>&1)
+	curl_exit=$?
 
-if [ $CURL_EXIT -ne 0 ]; then
-	if [ ! -S "$SOCKET" ] || [ $CURL_EXIT -eq 7 ]; then
-		echo "local-cli: cannot reach Local at $SOCKET — is Local running with the \"CLI Bridge\" add-on enabled?" >&2
-	else
-		echo "local-cli: $RESPONSE" >&2
+	if [ $curl_exit -ne 0 ]; then
+		if [ ! -S "$SOCKET" ] || [ $curl_exit -eq 7 ]; then
+			echo "local-cli: cannot reach Local at $SOCKET — is Local running with the \"CLI Bridge\" add-on enabled?" >&2
+		else
+			echo "local-cli: $response" >&2
+		fi
+		exit $EXIT_UNREACHABLE
 	fi
-	exit $EXIT_UNREACHABLE
+
+	STATUS=$(printf '%s' "$response" | tail -n 1)
+	BODY=$(printf '%s' "$response" | sed '$d')
+}
+
+# Print the reply the way the bridge said it, and exit accordingly.
+finish() {
+	case "$STATUS" in
+		2??) printf '%s\n' "$BODY"; exit 0 ;;
+		*)   printf 'local-cli: %s\n' "$BODY" >&2; exit $EXIT_FAILED ;;
+	esac
+}
+
+if [ "$TRUST_FLOW" -eq 1 ]; then
+	# Trusting needs sudo, and sudo needs a terminal: this one. The bridge hands
+	# over a short script (the same `security add-trusted-cert` / cp +
+	# update-ca-certificates recipe Local uses, minus the background sudo helper
+	# that macOS refuses), it runs here, and the bridge then re-checks and tells
+	# Local's window the site is trusted.
+	bridge GET /site/ssl plain
+	case "$STATUS" in 2??) ;; *) finish ;; esac
+	if [ "$(printf '%s' "$BODY" | cut -f4)" = "trusted" ]; then
+		FIELDS+=("already=1")
+		bridge POST /site/ssl/trust "$FORMAT"
+		finish
+	fi
+
+	bridge GET /site/ssl/script plain
+	case "$STATUS" in 2??) ;; *) finish ;; esac
+	if ! command -v sudo >/dev/null 2>&1; then
+		echo "local-cli: sudo is not available here. \"trust-ssl $SITE --print\" shows the commands to run with administrator rights, \"--gui\" lets Local ask for them." >&2
+		exit $EXIT_FAILED
+	fi
+	bash -c "$BODY" || {
+		echo "local-cli: trusting the certificate failed (exit $?)." >&2
+		exit $EXIT_FAILED
+	}
+	echo
+
+	bridge POST /site/ssl/trust "$FORMAT"
+	finish
 fi
 
-STATUS=$(printf '%s' "$RESPONSE" | tail -n 1)
-BODY=$(printf '%s' "$RESPONSE" | sed '$d')
-
-case "$STATUS" in
-	2??) printf '%s\n' "$BODY"; exit 0 ;;
-	*)   printf 'local-cli: %s\n' "$BODY" >&2; exit $EXIT_FAILED ;;
-esac
+bridge "$METHOD" "$ENDPOINT" "$FORMAT"
+finish

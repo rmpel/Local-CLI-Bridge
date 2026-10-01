@@ -1,5 +1,12 @@
 # Changelog for LocalWP Plugin "CLI Bridge"
 
+= 1.2.0 =
+
+- Released 2026-10-01.
+- `trust-ssl <site>`: trusts the site's SSL certificate from the terminal you are in. The bridge hands the client the platform's trust recipe (macOS `security add-trusted-cert … -p ssl`, Linux system CA folder plus NSS databases) as a script, the client runs it so `sudo` prompts inline instead of Local opening a dialog or a new Terminal window, and the bridge then re-checks and flips Local's SSL tab to "Trusted". Generates the certificate first when the site never ran. `--print` shows the script, `--gui` presses Local's own Trust button (honouring an add-on that took it over, such as Trust SSL — macOS Fix). Windows gets the `certutil` command to run in an elevated prompt.
+- `ssl-status <site>`: reports whether the certificate is trusted. On macOS this verifies the certificate under the SSL policy, so a certificate that Local's background sudo left in the keychain without trust settings shows as `in-keychain`, not trusted.
+- Bridge API: `GET /sites/{ref}/ssl`, `GET /sites/{ref}/ssl/script`, `POST /sites/{ref}/ssl/trust`.
+
 = 1.1.0 =
 
 - Released 2026-09-29.

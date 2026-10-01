@@ -4,7 +4,7 @@
  * needs curl. That keeps it immune to whatever `node` is active in the shell
  * (nvm switches, .nvmrc files, containerised runtimes).
  */
-import type { AddSiteResult, ChangeServiceResult, MultisiteReply, OpenResult, ServiceRow, SiteSummary } from './server';
+import type { AddSiteResult, ChangeServiceResult, MultisiteReply, OpenResult, ServiceRow, SiteSummary, SslStatus, TrustResult } from './server';
 
 export type Format = 'json' | 'table' | 'plain';
 
@@ -145,6 +145,29 @@ export const multisiteText = (data: MultisiteReply, format: Format): string => {
 		lines.push('', 'Add these rules to .htaccess yourself, replacing the WordPress block:', '', data.rulesForManualUse.trimEnd());
 	}
 	return lines.join('\n');
+};
+
+export const sslText = (data: SslStatus & Partial<TrustResult>, format: Format): string => {
+	const state = data.trusted ? 'trusted' : data.inKeychain ? 'in-keychain' : 'untrusted';
+	if (format === 'plain') {
+		return `${data.id}\t${data.name}\t${data.domain}\t${state}\t${data.certPath}`;
+	}
+	const who = `${data.name} (${data.id})`;
+	let head: string;
+	if (data.via === 'local' && data.pending) {
+		head = `${who}: handed the certificate for ${data.domain} to Local's own Trust flow; it is not trusted yet. Finish what Local opened, then check with ssl-status.`;
+	} else if (data.via && data.changed) {
+		head = `${who}: the certificate for ${data.domain} is now trusted.`;
+	} else if (data.via && data.trusted) {
+		head = `${who}: the certificate for ${data.domain} was already trusted; nothing to do.`;
+	} else if (data.trusted) {
+		head = `${who}: the certificate for ${data.domain} is trusted.`;
+	} else if (data.inKeychain) {
+		head = `${who}: the certificate for ${data.domain} is in the System keychain but not trusted for SSL (a Trust from Local's window that macOS silently refused). Run: local-cli trust-ssl ${data.id}`;
+	} else {
+		head = `${who}: the certificate for ${data.domain} is not trusted. Run: local-cli trust-ssl ${data.id}`;
+	}
+	return [head, `  Certificate: ${data.certPath}`].join('\n');
 };
 
 export const openText = (data: OpenResult, format: Format): string => {
