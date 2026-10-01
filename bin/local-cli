@@ -71,7 +71,7 @@ Other:
 
 <site> is a site ID, domain or name (case-insensitive); a unique prefix of
 the name or domain also works. Quote names containing spaces. When <site> is
-omitted, $LOCAL_SITE_ID, then $LOCAL_SITE_NAME, is used.
+omitted, $LOCALWP_SITE_ID, then $LOCALWP_SITE, is used.
 
 Options:
   --json    Print the raw JSON response (for scripts)
@@ -135,7 +135,7 @@ rest_from() {
 
 site_or_env() {
 	local site="$1"
-	[ -z "$site" ] && site="${LOCAL_SITE_ID:-${LOCAL_SITE_NAME:-}}"
+	[ -z "$site" ] && site="${LOCALWP_SITE_ID:-${LOCALWP_SITE:-}}"
 	printf '%s' "$site"
 }
 
@@ -181,10 +181,10 @@ case "$COMMAND" in
 		OP="$(pos 3)"
 		VALUE="$(pos 4)"
 		MAX_POS=4
-		# `change-site php 8.3` with the site in $LOCAL_SITE_ID / $LOCAL_SITE_NAME.
+		# `change-site php 8.3` with the site in $LOCALWP_SITE_ID / $LOCALWP_SITE.
 		case "$SITE" in
 			php|mysql|mariadb|apache|nginx|multisite)
-				if [ -n "${LOCAL_SITE_ID:-}${LOCAL_SITE_NAME:-}" ] && [ "$POS_COUNT" -le 3 ]; then
+				if [ -n "${LOCALWP_SITE_ID:-}${LOCALWP_SITE:-}" ] && [ "$POS_COUNT" -le 3 ]; then
 					VALUE="$OP"; OP="$SITE"; SITE=""; MAX_POS=3
 				fi
 				;;
@@ -213,7 +213,7 @@ esac
 
 if [ "$NEEDS_SITE" -eq 1 ]; then
 	SITE="$(site_or_env "$SITE")"
-	[ -z "$SITE" ] && die_usage "$COMMAND needs a site ID, domain or name (or set LOCAL_SITE_ID / LOCAL_SITE_NAME)"
+	[ -z "$SITE" ] && die_usage "$COMMAND needs a site ID, domain or name (or set LOCALWP_SITE_ID / LOCALWP_SITE)"
 	FIELDS+=("site=$SITE")
 fi
 
