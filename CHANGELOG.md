@@ -1,5 +1,11 @@
 # Changelog for LocalWP Plugin "CLI Bridge"
 
+= 1.3.0 =
+
+- Unreleased.
+- `sync-domains <site>` (alias `sync-hosts`): puts a network's sub-site hostnames in the hosts file through Local's own domain sync, for sub-sites added or deleted in wp-admin since the network was created. Starts a halted site first, reports every hostname with what was added or removed, and refuses on a site that is not a network.
+- Bridge API: `POST /sites/{ref}/sync-domains`.
+
 = 1.2.0 =
 
 - Released 2026-10-01.

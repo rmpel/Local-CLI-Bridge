@@ -4,10 +4,12 @@ import * as path from 'path';
 import type * as Local from '@getflywheel/local';
 import {
 	CONTENT_TYPES, Format, addSiteText, candidateTable, changeServiceText, multisiteText, openText, pingText,
-	servicesText, siteTable, sslText, transitionText,
+	servicesText, siteTable, sslText, syncDomainsText, transitionText,
 } from './format';
 import { BUILT_IN_SITE_DEFAULTS, NewSiteDefaults, deriveDomain, expandHome, formatSiteNicename, validateNewSite } from './new-site';
-import { MS_VALUES, MultisiteDeps, MultisiteError, MultisiteResult, NetworkType, changeMultisite, modeFromSite, parseNetworkTarget } from './multisite';
+import {
+	MS_VALUES, MultisiteDeps, MultisiteError, MultisiteResult, NetworkType, SyncDomainsResult, changeMultisite, modeFromSite, parseNetworkTarget, syncDomains,
+} from './multisite';
 import {
 	Platform, TrustCommand, buildTrustScript, commandLine, findOnPath, inSystemKeychain, trustCommands, verifiesForSsl,
 } from './ssl';
@@ -106,6 +108,8 @@ export interface ChangeServiceResult extends SiteSummary {
 }
 
 export type MultisiteReply = SiteSummary & MultisiteResult;
+
+export type SyncDomainsReply = SiteSummary & SyncDomainsResult;
 
 export interface SslStatus extends SiteSummary {
 	certPath: string;
@@ -467,6 +471,37 @@ export const createBridgeServer = (backend: SiteBackend, info: BridgeInfo, log: 
 		return { data, text: (format) => changeServiceText(data, format) };
 	};
 
+	const multisiteDeps: MultisiteDeps = {
+		wp: backend.wpCli,
+		getSite: backend.getSite,
+		getStatus: backend.getStatus,
+		start: backend.start,
+		restart: backend.restart,
+		updateSite: backend.updateSite,
+		syncSubdomains: backend.syncSubdomains,
+		localhostRouting: backend.localhostRouting,
+		phpDir: info.phpDir,
+		log,
+	};
+	const asHttpError = (err: any): Error => (err instanceof MultisiteError ? new HttpError(err.status, err.message, err.extra) : err);
+
+	/**
+	 * `sync-domains`: push the network's sub-site hostnames into the hosts
+	 * file, for sub-sites created or deleted in wp-admin since the last sync.
+	 */
+	const syncDomainsHandler = async (req: Request): Promise<Reply> => {
+		const site = siteFrom(req);
+		let result: SyncDomainsResult;
+		try {
+			result = await syncDomains(site, multisiteDeps);
+		} catch (err) {
+			throw asHttpError(err);
+		}
+		const fresh = backend.getSite(site.id) ?? site;
+		const data: SyncDomainsReply = { ...withStatus(fresh), ...result };
+		return { data, text: (format) => syncDomainsText(data, format) };
+	};
+
 	const changeMultisiteHandler = async (site: Local.Site, value: string, dryRun: boolean): Promise<Reply> => {
 		const target = parseNetworkTarget(value);
 		if (target === null) {
@@ -475,26 +510,11 @@ export const createBridgeServer = (backend: SiteBackend, info: BridgeInfo, log: 
 		if (target === 'off') {
 			throw new HttpError(400, 'Turning a network back into a single site is not supported: it means dropping the network tables and every sub-site. Do that by hand if you really want it.');
 		}
-		const deps: MultisiteDeps = {
-			wp: backend.wpCli,
-			getSite: backend.getSite,
-			getStatus: backend.getStatus,
-			start: backend.start,
-			restart: backend.restart,
-			updateSite: backend.updateSite,
-			syncSubdomains: backend.syncSubdomains,
-			localhostRouting: backend.localhostRouting,
-			phpDir: info.phpDir,
-			log,
-		};
 		let result: MultisiteResult;
 		try {
-			result = await changeMultisite(site, target, deps, dryRun);
+			result = await changeMultisite(site, target, multisiteDeps, dryRun);
 		} catch (err) {
-			if (err instanceof MultisiteError) {
-				throw new HttpError(err.status, err.message, err.extra);
-			}
-			throw err;
+			throw asHttpError(err);
 		}
 		const fresh = backend.getSite(site.id) ?? site;
 		const data: MultisiteReply = { ...withStatus(fresh), ...result };
@@ -706,6 +726,7 @@ export const createBridgeServer = (backend: SiteBackend, info: BridgeInfo, log: 
 		{ method: 'POST', pattern: /^\/site\/restart$/, handler: (req) => transition(req, 'restart') },
 		{ method: 'POST', pattern: /^\/site\/change$/, handler: change },
 		{ method: 'POST', pattern: /^\/site\/open$/, handler: open },
+		{ method: 'POST', pattern: /^\/site\/sync-domains$/, handler: syncDomainsHandler },
 		{ method: 'GET', pattern: /^\/site\/ssl$/, handler: ssl },
 		{ method: 'GET', pattern: /^\/site\/ssl\/script$/, handler: sslScript },
 		{ method: 'POST', pattern: /^\/site\/ssl\/trust$/, handler: sslTrust },
@@ -717,6 +738,7 @@ export const createBridgeServer = (backend: SiteBackend, info: BridgeInfo, log: 
 		{ method: 'POST', pattern: /^\/sites\/([^/]+)\/restart$/, handler: (req) => transition(req, 'restart') },
 		{ method: 'POST', pattern: /^\/sites\/([^/]+)\/change$/, handler: change },
 		{ method: 'POST', pattern: /^\/sites\/([^/]+)\/open$/, handler: open },
+		{ method: 'POST', pattern: /^\/sites\/([^/]+)\/sync-domains$/, handler: syncDomainsHandler },
 	];
 
 	const send = (res: http.ServerResponse, status: number, format: Format, body: string) => {

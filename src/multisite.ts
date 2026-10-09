@@ -22,6 +22,11 @@ export type { NetworkType } from './htaccess';
  * own network rewrite rules in .htaccess (nginx sites get them from Local's
  * template on restart), sub-site domains are synced and the site restarts.
  * Downgrading a network to a single site is deliberately not offered.
+ *
+ * `syncDomains` runs that domain sync on its own, for sub-sites added or
+ * removed in wp-admin since: Local's `multiSite.syncSubdomains()` asks
+ * WP-CLI for `wp site list --field=url`, stores the list on the site as
+ * `multiSiteDomains` and restarts its router, which rewrites the hosts file.
  */
 
 export type NetworkMode = '' | NetworkType;
@@ -253,5 +258,91 @@ export const changeMultisite = async (
 	await deps.restart(fresh);
 	result.steps.push('restarted the site');
 	result.changed = true;
+	return result;
+};
+
+export interface SyncDomainsResult {
+	mode: NetworkType;
+	started: boolean;
+	/** The set of hostnames differs from what Local had stored before. */
+	changed: boolean;
+	/** Sub-site URLs as WordPress lists them (`wp site list --field=url`), what Local stores on the site. */
+	urls: string[];
+	/** The hostnames Local puts in the hosts file, deduplicated and sorted. */
+	hostnames: string[];
+	added: string[];
+	removed: string[];
+	steps: string[];
+}
+
+/** Hostnames out of the URLs Local stores; tolerant of bare domains and junk lines. */
+export const hostnamesOf = (urls: unknown): string[] => {
+	const names = new Set<string>();
+	for (const url of Array.isArray(urls) ? urls : []) {
+		if (typeof url !== 'string' || !url.trim()) {
+			continue;
+		}
+		const spec = url.trim();
+		try {
+			names.add(new URL(spec.includes('://') ? spec : `http://${spec}`).hostname.toLowerCase());
+		} catch {
+			names.add(spec.replace(/^[a-z]+:\/\//i, '').replace(/[/:?#].*$/, '').toLowerCase());
+		}
+	}
+	return [...names].sort();
+};
+
+export const syncDomains = async (site: Local.Site, deps: MultisiteDeps): Promise<SyncDomainsResult> => {
+	const result: SyncDomainsResult = {
+		mode: 'subdir',
+		started: false,
+		changed: false,
+		urls: [],
+		hostnames: [],
+		added: [],
+		removed: [],
+		steps: [],
+	};
+
+	// Local's sync runs WP-CLI, which needs the site's PHP and database.
+	if (deps.getStatus(site) !== 'running') {
+		await deps.start(site);
+		result.started = true;
+		result.steps.push('started the site');
+	}
+
+	if (!(await isInstalled(deps, site, false))) {
+		throw new MultisiteError(409, `WordPress is not installed on "${site.name}".`);
+	}
+	if (!(await isInstalled(deps, site, true))) {
+		throw new MultisiteError(409, `"${site.name}" is not a network, so there are no sub-site domains to sync.`);
+	}
+	const mode = await currentNetworkMode(deps, site);
+	result.mode = mode;
+	const recorded = modeFromSite(site);
+	if (recorded !== mode) {
+		deps.updateSite(site.id, { multiSite: MS_VALUES[mode] });
+		result.steps.push(`recorded the ${mode} network mode on the site, Local had it ${recorded ? 'wrong' : 'missing'}`);
+	}
+
+	const before = hostnamesOf((site as any).multiSiteDomains);
+	deps.log(`Syncing the sub-site domains of "${site.name}" (${site.id})`);
+	await deps.syncSubdomains(site);
+	const stored = (deps.getSite(site.id) as any)?.multiSiteDomains;
+	result.urls = (Array.isArray(stored) ? stored : []).filter((url: unknown) => typeof url === 'string' && url.trim());
+	result.hostnames = hostnamesOf(result.urls);
+	result.added = result.hostnames.filter((name) => !before.includes(name));
+	result.removed = before.filter((name) => !result.hostnames.includes(name));
+	result.changed = result.added.length > 0 || result.removed.length > 0;
+
+	const count = result.urls.length;
+	result.steps.push(`asked WordPress for the sub-site addresses (${count} sub-site${count === 1 ? '' : 's'})`);
+	result.steps.push("stored them on the site and reloaded Local's router, which rewrites the hosts file");
+	if (mode === 'subdir') {
+		result.steps.push('a subdirectory network shares one hostname, so the hosts file needs no extra entries');
+	}
+	if (deps.localhostRouting()) {
+		result.steps.push('Local routes sites through localhost, a mode in which the hosts file is not used');
+	}
 	return result;
 };

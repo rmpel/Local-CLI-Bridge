@@ -49,6 +49,8 @@ Sites:
                                    Swap a service, like the site's "Custom" environment picker
   change-site <site> multisite subdir|subdomain [--dry-run]
                                    Turn a site into a network, or switch the network type
+  sync-domains <site>              Put a network's sub-site hostnames in the hosts file, like
+                                   Local's own domain sync; alias: sync-hosts
 
 Open in the browser:
   open    <site> [--url] [--start] Open the site
@@ -193,6 +195,8 @@ case "$COMMAND" in
 		[ "$POS_COUNT" -gt "$MAX_POS" ] && die_usage "too many arguments for change-site (quote site names containing spaces)"
 		FIELDS+=("op=$OP" "value=$VALUE")
 		;;
+	sync-domains|sync-hosts)
+	               METHOD=POST; ENDPOINT=/site/sync-domains; NEEDS_SITE=1; SITE="$(rest_from 2)" ;;
 	open)          METHOD=POST; ENDPOINT=/site/open; NEEDS_SITE=1; SITE="$(rest_from 2)"; FIELDS+=("target=site") ;;
 	admin)         METHOD=POST; ENDPOINT=/site/open; NEEDS_SITE=1; SITE="$(rest_from 2)"; FIELDS+=("target=admin") ;;
 	db|adminneo)   METHOD=POST; ENDPOINT=/site/open; NEEDS_SITE=1; SITE="$(rest_from 2)"; FIELDS+=("target=db") ;;

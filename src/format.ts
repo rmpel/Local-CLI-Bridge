@@ -4,7 +4,9 @@
  * needs curl. That keeps it immune to whatever `node` is active in the shell
  * (nvm switches, .nvmrc files, containerised runtimes).
  */
-import type { AddSiteResult, ChangeServiceResult, MultisiteReply, OpenResult, ServiceRow, SiteSummary, SslStatus, TrustResult } from './server';
+import type {
+	AddSiteResult, ChangeServiceResult, MultisiteReply, OpenResult, ServiceRow, SiteSummary, SslStatus, SyncDomainsReply, TrustResult,
+} from './server';
 
 export type Format = 'json' | 'table' | 'plain';
 
@@ -144,6 +146,26 @@ export const multisiteText = (data: MultisiteReply, format: Format): string => {
 	if (data.rulesForManualUse) {
 		lines.push('', 'Add these rules to .htaccess yourself, replacing the WordPress block:', '', data.rulesForManualUse.trimEnd());
 	}
+	return lines.join('\n');
+};
+
+export const syncDomainsText = (data: SyncDomainsReply, format: Format): string => {
+	if (format === 'plain') {
+		return `${data.id}\t${data.name}\t${data.status}\t${data.changed ? 'changed' : 'unchanged'}\t${data.mode}\t${data.hostnames.join(',')}`;
+	}
+	const count = data.urls.length;
+	const delta = [
+		data.added.length ? `${data.added.length} added` : '',
+		data.removed.length ? `${data.removed.length} removed` : '',
+	].filter(Boolean).join(', ');
+	const head = `${data.name} (${data.id}): synced ${count} sub-site${count === 1 ? '' : 's'} of the ${networkLabel(data.mode)}; `
+		+ (data.changed ? `hostnames ${delta}.` : 'hostnames unchanged.');
+	const lines = [head, ...data.steps.map((step) => `  - ${step}`)];
+	if (data.hostnames.length) {
+		lines.push('  Hostnames:');
+		lines.push(...data.hostnames.map((name) => `    ${data.added.includes(name) ? '+ ' : '  '}${name}`));
+	}
+	lines.push(...data.removed.map((name) => `    - ${name} (removed)`));
 	return lines.join('\n');
 };
 

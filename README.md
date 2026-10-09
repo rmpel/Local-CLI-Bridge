@@ -65,6 +65,7 @@ local-cli change-site my-site php 8.3
 local-cli change-site my-site mysql 8.4
 local-cli change-site my-site apache
 local-cli change-site my-site multisite subdomain [--dry-run]
+local-cli sync-domains my-site            (alias: sync-hosts)
 local-cli services [php|db|http]
 
 local-cli open    my-site [--url] [--start]
@@ -157,6 +158,19 @@ block; a hand-written file is left alone and the rules are printed). nginx
 sites get them from Local's template. Turning a network back into a single
 site is deliberately not offered.
 
+### sync-domains
+
+Puts the hostnames of a network's sub-sites in the hosts file, for sub-sites
+created or deleted in wp-admin since the network was set up: Local only does
+this by itself when the site is created or converted. It is Local's own
+domain sync (`wp site list --field=url`, stored on the site, router reloaded,
+hosts file rewritten), so the result is the same as Local's "Sync" in the
+site's Overview. A halted site is started first, since WP-CLI needs it. The
+reply lists every hostname and marks what was added or removed since the
+previous sync. A subdirectory network shares one hostname, so the sync
+changes nothing there, and it refuses on a site that is not a network.
+Alias: `sync-hosts`.
+
 ### open, admin, db, mailpit
 
 Open the site, `wp-admin`, the bundled AdminNeo database manager or Mailpit
@@ -243,6 +257,7 @@ with the state `trusted`, `untrusted` or `in-keychain`.
   | POST   | `/sites/{ref}/restart`    | Restart                                                            |
   | POST   | `/sites/{ref}/change`     | `op=php\|mysql\|mariadb\|apache\|nginx\|multisite`, `value=…`, `dry-run=1` |
   | POST   | `/sites/{ref}/open`       | `target=site\|admin\|mailpit\|db`, `auto-login=1`, `url=1`, `start=1`  |
+  | POST   | `/sites/{ref}/sync-domains` | Sync a network's sub-site hostnames to the hosts file                |
   | GET    | `/sites/{ref}/ssl`        | Certificate path, trust state and the trust commands for this platform |
   | GET    | `/sites/{ref}/ssl/script` | The trust recipe as a bash script (text), for the client to run         |
   | POST   | `/sites/{ref}/ssl/trust`  | Re-check and tell Local's UI; `gui=1` presses Local's Trust button      |
